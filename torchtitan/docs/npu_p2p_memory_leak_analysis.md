@@ -4,7 +4,7 @@
 
 | 项目 | 说明 |
 |------|------|
-| 环境 | Ascend 910B3, torch 2.11, torch_npu 2.11 |
+| 环境 | Ascend 910B, torch 2.11rc1, torch_npu 2.11 |
 | 模型 | Qwen3-8B (4 层 debug 模型) |
 | 并行配置 | PP=2, DP=1, TP=1, DualPipeV schedule, 4 microbatches |
 | 现象 | 每步泄漏 ~134 MB (rank 0) / ~159 MB (rank 1)，200 步后 OOM |
@@ -16,7 +16,19 @@
 
 ### 2.1 确认泄漏存在
 
-**手段**：per-step `torch.npu.memory_allocated()` 采样
+**手段**：在 `_PipelineScheduleRuntime._step_microbatches` 中插入 patch，step 前后各采样一次 `memory_allocated()`：
+
+```python
+def _patched_step(self, *args, **kwargs):
+    stats_begin = torch.npu.memory_allocated()
+    try:
+        return _orig_step(self, *args, **kwargs)
+    finally:
+        stats_end = torch.npu.memory_allocated()
+        # BEGIN-baseline 线性增长 → 泄漏存在
+```
+
+输出：
 
 ```
 [MEM_TRACE] step=N BEGIN allocated=19.5GB → step=N END allocated=26.1GB
@@ -35,7 +47,35 @@ allocated 在 step 之间的 **baseline 线性增长**，确认有泄漏。
 
 ### 2.3 定位泄漏形状
 
-**手段**：`gc.get_objects()` 全量扫描，按 `(shape, dtype)` 分组
+**手段**：`gc.get_objects()` 全量扫描，按 `(shape, dtype)` 分组统计 count 和 total_bytes。在 step 2→3 各采样一次做 diff，找出 count 增长 ≥4 的 shape：
+
+```python
+def _gc_scan():
+    torch.npu.synchronize()
+    gc.collect()
+    groups = collections.defaultdict(lambda: [0, 0])  # key → (count, total_bytes)
+    for obj in gc.get_objects():
+        if type(obj) is not torch.Tensor or obj.device.type != "npu":
+            continue
+        sz = obj.numel() * obj.element_size()
+        key = (tuple(obj.shape), obj.dtype)
+        g = groups[key]
+        g[0] += 1
+        g[1] += sz
+    return dict(groups)
+
+# 2-step diff 发现泄漏 shape
+if step in (2, 3):
+    cur_groups = _gc_scan()
+    if prev_groups:
+        for key in set(prev_groups.keys()) | set(cur_groups.keys()):
+            delta = cur_cnt - prev_cnt
+            if delta >= 4:                   # 增长 ≥4 → 候选泄漏 shape
+                candidates.append((delta, key))
+    prev_groups = cur_groups
+```
+
+输出：
 
 ```
 [GC_SCAN] step=3: [402.7MB x48] 1x1024x4096 torch.bfloat16
@@ -49,15 +89,40 @@ allocated 在 step 之间的 **baseline 线性增长**，确认有泄漏。
 
 **手段**：BFS 从 `self._stages` 遍历所有属性，追踪到 `PipelineStage.args_recv_info[*][*].buffer`
 
+```python
+def _trace_holders(stages):
+    """BFS 遍历 stages 全部属性，找到持有的 NPU tensor"""
+    for i, stage in enumerate(stages):
+        visited = set()
+        queue = [(f"stages[{i}]", stage)]
+        while queue:
+            path, obj = queue.pop(0)
+            if id(obj) in visited:
+                continue
+            visited.add(id(obj))
+            if type(obj) is torch.Tensor and obj.device.type == "npu":
+                print(f"[GC_HOLD2] {path} → tensor[{tuple(obj.shape)}] {obj.dtype}")
+            if hasattr(obj, "__dict__"):
+                for attr, val in vars(obj).items():
+                    queue.append((f"{path}.{attr}", val))
+            elif isinstance(obj, (list, tuple)):
+                for j, item in enumerate(obj):
+                    queue.append((f"{path}[{j}]", item))
+```
+
+输出：
+
 ```
 [GC_HOLD2] walk from known API objects:
   ✓ self._stages[1] → _stages[1].args_recv_info
 ```
 
 Tensor 属性：
+
 ```
 grad_fn=None, requires_grad=False, is_leaf=True, _version=0
 ```
+
 纯 P2P 接收 buffer，不在 autograd 图中，不会被 `backward()` 自动释放。
 
 ### 2.5 确认 Python GC 无法释放
@@ -71,13 +136,48 @@ grad_fn=None, requires_grad=False, is_leaf=True, _version=0
 | 清空 `args_recv_info` list | 不生效 | 同上，C 层引用在 Python GC 视野之外 |
 | `gc.collect()` + `del` | 不生效 | Python GC 无法跨越 C 层引用屏障 |
 
-**关键发现**：`gc.get_referrers()` 只能追踪 Python 对象到 Python 对象的引用链。HCCL C 代码持有的 tensor 引用对 Python GC 完全不可见。这是 Python 无法跨越的墙。
+**关键发现**：用 `gc.get_referrers()` 验证引用链 — 泄漏 tensor 的引用者全部显示为空或不可达：
+
+```python
+for obj in gc.get_objects():
+    if type(obj) is torch.Tensor and tuple(obj.shape) == (1, 1024, 4096):
+        referrers = gc.get_referrers(obj)
+        # referrers 中没有任何 Python 对象持有该 tensor
+        # → C 层引用对 gc.get_referrers() 完全不可见
+```
+
+`gc.get_referrers()` 只能追踪 Python 对象到 Python 对象的引用链。HCCL C 代码持有的 tensor 引用对 Python GC 完全不可见。这是 Python 无法跨越的墙。
 
 ### 2.6 确认绕过 C 层引用的方法
+
+在 finally 块中对自动检测到的目标 shape 的 NPU tensor 调用 `.storage().resize_(0)`：
+
+```python
+_resize_targets = [((1, 1024, 4096), torch.bfloat16)]  # 来自 2.3 的 auto-detect
+target_set = set(_resize_targets)
+for obj in gc.get_objects():
+    if type(obj) is not torch.Tensor or obj.device.type != "npu":
+        continue
+    if (tuple(obj.shape), obj.dtype) not in target_set:
+        continue
+    obj.storage().resize_(0)   # 绕过 Python + C 层引用直接释放 NPU 显存
+    resized_count += 1
+```
 
 `.storage().resize_(0)` 直接调用 NPU 驱动释放显存，不依赖 Python refcnt 和 C 层引用计数。
 
 ### 2.7 确认 resize 单独不生效的原因
+
+resize 后分别在 `empty_cache()` 前后采样 `memory_reserved()`，对比 freed 量：
+
+```python
+stats_before = torch.npu.memory_reserved()
+torch.npu.empty_cache()
+stats_after = torch.npu.memory_reserved()
+freed = stats_before - stats_after
+# expandable_segments:True  → freed ≈ 0，reserved 持续增长
+# expandable_segments:False → freed > 0，reserved 可回收
+```
 
 resize 后 `allocated` baseline 稳定（不再增长），但 **reserved 内存持续膨胀**：
 
@@ -98,9 +198,9 @@ PYTORCH_NPU_ALLOC_CONF="expandable_segments:True" 下：
 验证结果：
 ```
 [MEM_TRACE] step=10  BEGIN allocated=9.264GB
-[MEM_TRACE] step=50  BEGIN allocated=9.264GB  ← 完全稳定
-[MEM_TRACE] step=100 BEGIN allocated=9.264GB  ← 纹丝不动
-[EMPTY_CACHE] step=N reserved 22.1GB→12.4GB (freed 9732.9MB) ← 每步回收
+[MEM_TRACE] step=50  BEGIN allocated=9.264GB   完全稳定
+[MEM_TRACE] step=100 BEGIN allocated=9.264GB   纹丝不动
+[EMPTY_CACHE] step=N reserved 22.1GB→12.4GB (freed 9732.9MB)  每步回收
 ```
 
 ---
@@ -136,11 +236,6 @@ torchtitan/train.py
 | **torch_npu** `dist.irecv` 实现 | 未复用传入的 buffer，内部分配新 tensor 用于接收 |
 | **HCCL** P2P receive | 完成接收后未释放内部临时 buffer 的引用 |
 
-正常行为（CUDA/NCCL）：
-```
-dist.irecv(tensor, peer)  →  NCCL 直接写入 tensor 的 storage，不创建新 tensor
-```
-
 Ascend NPU 实际行为：
 ```
 dist.irecv(tensor, peer)  →  HCCL 创建新 tensor → 接收数据 → 拷贝到 tensor
@@ -160,44 +255,9 @@ PP=2, 4 microbatches, DualPipeV:
 
 ---
 
-## 4. torchtitan 侧修复策略（workaround）
+## 4. PTA 侧修复
 
-文件：`torchtitan/_npu_workarounds.py`
-
-### Patch 1：`autograd.grad` 强制 `allow_unused=True`
-
-NPU autograd 对未使用参数的检测不准确，会导致误报 "does not appear to be used in the graph" 错误。
-
-### Patch 2：P2P recv buffer 泄漏 workaround
-
-```
-每步 _step_microbatches 的 finally 块中：
-
-1. cleanup unconsumed P2P ops
-   ↓
-2. clear_runtime_states() + 替换 args_recv_info/grad_recv_info buffer 为 dummy tensor
-   目的：防止 clear_runtime_states 在旧 buffer 上累积 grad
-   ↓
-3. .storage().resize_(0) 清零所有泄漏 tensor 的 storage
-   通过 GC 扫描找到目标 shape（auto-detected）的 NPU tensor
-   直接 release 底层显存分配，绕开 Python/C 引用计数
-   ↓
-4. torch.npu.empty_cache()
-   配合 expandable_segments:False，回收空闲 segment 给 OS
-```
-
-### 通用性设计
-
-- **自适应 shape 检测**：step 2→3 的 GC diff 自动发现增长最快的 NPU tensor shape，不硬编码
-- 适配任意 seq_len、hidden_dim、PP 度
-- 不依赖模型结构、层数
-- 不推荐，最好在PTA的cpp侧后端底层修改
-
----
-
-## 5. PTA 侧修复建议
-
-### 5.1 torch_npu 修复
+### 4.1 torch_npu 修复
 
 **文件**：torch_npu 中 `dist.irecv` / `P2POp` 的实现
 
@@ -206,20 +266,45 @@ NPU autograd 对未使用参数的检测不准确，会导致误报 "does not ap
 2. 如果必须使用中间 buffer（HCCL 限制），应在 P2P 完成后立即释放，不保留引用
 
 **代码链接**
-https://gitcode.com/Ascend/pytorch/pull/36161
+https://gitcode.com/Ascend/pytorch/pull/32317
 
-### 5.2 HCCL 修复
+### 4.2 前后修复PR对比
+从最近的百来次PR，经过二分定位，定位到!32317PR成功修复了泄露
 
-**文件**：HCCL P2P receive 相关代码
+#### 泄露根因
 
-**修复方向**：
-1. 确保 receive 操作复用外部传入的内存，不分配额外 buffer
-2. 如有内部分配，在 wait/同步点后释放
+PR [#32267] 中 NPU 侧的 `_batch_isend_irecv` 直接调用 C++ 的 `batch_isend_irecv`，每个 P2P op 独立创建 Work 对象，缺乏统一的 coalescing 框架管理生命周期：
 
-### 5.3 验证方法
+```python
+# PR #32267 — 泄露路径
+return [_group.batch_isend_irecv(op_type, tensors, remote_rank_list)]
+```
 
-修复后，以下指标应全部满足：
-- per-step GC 扫描：`[1, seq_len, hidden_dim]` tensor 数量不随步数增长
-- `memory_allocated()` baseline 稳定
-- `memory_reserved()` 不持续膨胀
-- 不依赖 `_npu_workarounds.py` 即可稳定训练 1000+ 步
+C++ 侧 `pointToPoint()` 中 `recorded_inputs_`、`recordStream` 无条件执行，Work 对象粒度过细，tensor 存储引用无法及时回收。
+
+#### 修复方案
+
+PR [#32317] 在 Python 侧对支持设备（Ascend910B1+ / CANN >= 9.0.0）改用 coalescing manager，C++ 侧引入 `coalescing_state_` 状态机：
+
+```python
+# PR #32317 — 修复路径
+if cann_version >= "9.0.0" and is_supported_device_name:
+    with _coalescing_manager(group=group, device=device, async_ops=True) as cm:
+        for p2p_op in p2p_op_list:
+            p2p_op.op(...)
+    return cm.works
+else:
+    return [_group.batch_isend_irecv(op_type, tensors, remote_rank_list)]
+```
+
+#### C++ 侧关键变更（ProcessGroupHCCL.cpp）
+
+| 改动点 | PR #32267 | PR #32317 |
+|---|---|---|
+| Work 创建 | 每个 op 独立创建 | coalescing 时延迟到 `endCoalescing` |
+| tensor 暂存 | 无 | `coalescedTensors_.stash(tensors)` |
+| `recorded_inputs_` | 无条件 push | `!coalescing_state_` 守卫 |
+| `recordStream` | 无条件执行 | `!coalescing_state_` 守卫 |
+| seqP2P_ 递增 | 每个 op 递增 | coalescing 时按 group 递增一次 |
+
+核心思路：将多个 P2P ops 合并为一个 coalescing group 统一调度，从架构层面解决 Work 对象粒度和 tensor 生命周期管理问题。
