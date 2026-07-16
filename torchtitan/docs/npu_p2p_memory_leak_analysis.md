@@ -18,6 +18,9 @@
 
 **手段**：在 `_PipelineScheduleRuntime._step_microbatches` 中插入 patch，step 前后各采样一次 `memory_allocated()`：
 
+> _step_microbatches: 使用微批次列表运行一次流水线调度迭代。将按照调度实现遍历所有微批次。
+> _PipelineScheduleRuntime: 提供一个简单的运行时环境，需要“调度 IR”，其中包括指定的通信操作。
+
 ```python
 def _patched_step(self, *args, **kwargs):
     stats_begin = torch.npu.memory_allocated()
